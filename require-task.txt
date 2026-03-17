@@ -1,0 +1,553 @@
+1. Cấu trúc project
+binance-data-downloader/
+├── download_data.py      # Script chính
+├── config.py             # Cấu hình
+├── requirements.txt      # Dependencies
+├── .env                  # Environment variables (optional)
+└── data/                 # Thư mục lưu dữ liệu (tự động tạo)
+    ├── raw/              # File zip gốc
+    └── processed/        # File CSV đã giải nén
+
+2. File requirements.txt
+requests==2.31.0
+pandas==2.0.3
+python-dotenv==1.0.0
+tqdm==4.66.1
+aiohttp==3.8.5
+asyncio==3.4.3
+
+3. File config.py
+# config.py
+import os
+from pathlib import Path
+
+# Đường dẫn
+BASE_DIR = Path(__file__).parent
+DATA_DIR = BASE_DIR / "data"
+RAW_DIR = DATA_DIR / "raw"
+PROCESSED_DIR = DATA_DIR / "processed"
+
+# Tạo thư mục nếu chưa tồn tại
+for dir_path in [DATA_DIR, RAW_DIR, PROCESSED_DIR]:
+    dir_path.mkdir(parents=True, exist_ok=True)
+
+# Cấu hình download
+INTERVALS = ['1h', '4h']  # Khung thời gian cần tải
+START_YEAR = 2019
+END_YEAR = 2025  # Sẽ tự điều chỉnh đến tháng hiện tại
+
+# Số lượng coin top volume muốn tải
+TOP_COINS_LIMIT = 100
+
+# Số luồng tải song song
+MAX_WORKERS = 5
+
+# Binance API endpoints
+BINANCE_API_URL = "https://api.binance.com/api/v3"
+BINANCE_DATA_URL = "https://data.binance.vision"
+
+4. File download_data.py (Script chính)
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Binance Spot Data Downloader
+Tải dữ liệu lịch sử cho nhiều coin, nhiều khung thời gian
+Author: Crypto Trader
+Date: 2024
+"""
+
+import os
+import sys
+import json
+import zipfile
+import requests
+import pandas as pd
+from datetime import datetime, timedelta
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from tqdm import tqdm
+import time
+import logging
+from typing import List, Dict, Optional, Tuple
+
+# Import config
+from config import (
+    RAW_DIR, PROCESSED_DIR, INTERVALS, START_YEAR, END_YEAR,
+    TOP_COINS_LIMIT, MAX_WORKERS, BINANCE_API_URL, BINANCE_DATA_URL
+)
+
+# Thiết lập logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(RAW_DIR / 'download.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+
+class BinanceDataDownloader:
+    """
+    Binance Data Downloader Class
+    Hỗ trợ tải bulk data cho spot market
+    """
+    
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        })
+        
+    def get_top_volume_symbols(self, limit: int = 100) -> List[str]:
+        """
+        Lấy danh sách top coins theo volume 24h từ Binance
+        
+        Args:
+            limit: Số lượng coin muốn lấy
+            
+        Returns:
+            List[str]: Danh sách symbols (ví dụ: ['BTCUSDT', 'ETHUSDT'])
+        """
+        try:
+            # Lấy 24h ticker price stats
+            url = f"{BINANCE_API_URL}/ticker/24hr"
+            response = self.session.get(url)
+            response.raise_for_status()
+            
+            tickers = response.json()
+            
+            # Lọc các cặp USDT và có volume > 0
+            usdt_pairs = [
+                t for t in tickers 
+                if t['symbol'].endswith('USDT') 
+                and float(t['quoteVolume']) > 0
+                and not t['symbol'].startswith('USDC')  # Bỏ stablecoin
+                and not t['symbol'].startswith('BUSD')
+                and not t['symbol'].startswith('DAI')
+                and not t['symbol'].startswith('TUSD')
+            ]
+            
+            # Sắp xếp theo quoteVolume (volume USDT) giảm dần
+            sorted_pairs = sorted(
+                usdt_pairs, 
+                key=lambda x: float(x['quoteVolume']), 
+                reverse=True
+            )
+            
+            # Lấy top symbols
+            top_symbols = [p['symbol'] for p in sorted_pairs[:limit]]
+            
+            logger.info(f"✅ Đã lấy {len(top_symbols)} top coins theo volume")
+            logger.info(f"Top 10: {', '.join(top_symbols[:10])}")
+            
+            return top_symbols
+            
+        except Exception as e:
+            logger.error(f"❌ Lỗi khi lấy top symbols: {e}")
+            # Fallback to a predefined list if API fails
+            return [
+                'BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT',
+                'ADAUSDT', 'AVAXUSDT', 'DOGEUSDT', 'DOTUSDT', 'LINKUSDT',
+                'MATICUSDT', 'SHIBUSDT', 'LTCUSDT', 'UNIUSDT', 'ATOMUSDT',
+                'ETCUSDT', 'FILUSDT', 'ICPUSDT', 'NEARUSDT', 'APTUSDT',
+                'OPUSDT', 'ARBUSDT', 'HBARUSDT', 'VETUSDT', 'ALGOUSDT'
+            ][:limit]
+    
+    def get_available_months(self, symbol: str, interval: str) -> List[Tuple[int, int]]:
+        """
+        Kiểm tra những tháng nào có dữ liệu trên Binance Data
+        
+        Args:
+            symbol: Trading pair (ví dụ: 'BTCUSDT')
+            interval: Khung thời gian ('1h', '4h')
+            
+        Returns:
+            List[Tuple[int, int]]: Danh sách (năm, tháng) có dữ liệu
+        """
+        available = []
+        current_date = datetime.now()
+        
+        for year in range(START_YEAR, current_date.year + 1):
+            start_month = 1
+            end_month = 12
+            
+            if year == current_date.year:
+                end_month = current_date.month
+            
+            for month in range(start_month, end_month + 1):
+                # Kiểm tra file tồn tại bằng HEAD request
+                url = f"{BINANCE_DATA_URL}/data/spot/monthly/klines/{symbol}/{interval}/{symbol}-{interval}-{year}-{month:02d}.zip"
+                try:
+                    response = self.session.head(url, timeout=5)
+                    if response.status_code == 200:
+                        available.append((year, month))
+                    else:
+                        # Thử daily nếu monthly không có
+                        daily_url = f"{BINANCE_DATA_URL}/data/spot/daily/klines/{symbol}/{interval}/{symbol}-{interval}-{year}-{month:02d}-01.zip"
+                        daily_response = self.session.head(daily_url, timeout=5)
+                        if daily_response.status_code == 200:
+                            available.append((year, month))
+                except:
+                    continue
+                    
+        return available
+    
+    def download_monthly_data(
+        self, 
+        symbol: str, 
+        interval: str, 
+        year: int, 
+        month: int
+    ) -> Optional[str]:
+        """
+        Tải dữ liệu hàng tháng cho 1 symbol
+        
+        Args:
+            symbol: Trading pair
+            interval: Khung thời gian
+            year: Năm
+            month: Tháng
+            
+        Returns:
+            Optional[str]: Đường dẫn file nếu tải thành công, None nếu thất bại
+        """
+        # Tạo tên file
+        filename = f"{symbol}-{interval}-{year}-{month:02d}.zip"
+        filepath = RAW_DIR / filename
+        
+        # Kiểm tra nếu file đã tồn tại
+        if filepath.exists():
+            # Kiểm tra file có bị hỏng không
+            try:
+                with zipfile.ZipFile(filepath, 'r') as zip_ref:
+                    if zip_ref.testzip() is None:
+                        logger.debug(f"📁 File {filename} đã tồn tại và OK")
+                        return str(filepath)
+            except:
+                logger.warning(f"⚠️ File {filename} bị hỏng, tải lại...")
+                filepath.unlink()  # Xóa file hỏng
+        
+        # Thử tải từ monthly trước
+        monthly_url = f"{BINANCE_DATA_URL}/data/spot/monthly/klines/{symbol}/{interval}/{filename}"
+        
+        # Thử tải với retry
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                response = self.session.get(monthly_url, stream=True, timeout=30)
+                
+                # Nếu monthly không có, thử daily
+                if response.status_code != 200:
+                    daily_filename = f"{symbol}-{interval}-{year}-{month:02d}-01.zip"
+                    daily_url = f"{BINANCE_DATA_URL}/data/spot/daily/klines/{symbol}/{interval}/{daily_filename}"
+                    response = self.session.get(daily_url, stream=True, timeout=30)
+                
+                if response.status_code == 200:
+                    total_size = int(response.headers.get('content-length', 0))
+                    
+                    with open(filepath, 'wb') as f:
+                        with tqdm(
+                            total=total_size,
+                            unit='B',
+                            unit_scale=True,
+                            desc=f"{symbol} {interval} {year}-{month:02d}",
+                            leave=False
+                        ) as pbar:
+                            for chunk in response.iter_content(chunk_size=8192):
+                                f.write(chunk)
+                                pbar.update(len(chunk))
+                    
+                    # Verify file
+                    with zipfile.ZipFile(filepath, 'r') as zip_ref:
+                        if zip_ref.testzip() is not None:
+                            raise Exception("File bị hỏng")
+                    
+                    logger.debug(f"✅ Downloaded: {filename}")
+                    return str(filepath)
+                    
+                elif attempt < max_retries - 1:
+                    wait_time = 2 ** attempt
+                    logger.debug(f"⏳ Thử lại {filename} sau {wait_time}s...")
+                    time.sleep(wait_time)
+                else:
+                    logger.debug(f"❌ Không tìm thấy {filename} (HTTP {response.status_code})")
+                    
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt
+                    logger.debug(f"⏳ Lỗi {e}, thử lại sau {wait_time}s...")
+                    time.sleep(wait_time)
+                else:
+                    logger.error(f"❌ Lỗi tải {filename}: {e}")
+                    
+        return None
+    
+    def process_zip_to_csv(self, zip_path: str) -> Optional[pd.DataFrame]:
+        """
+        Giải nén file zip và chuyển thành DataFrame
+        
+        Args:
+            zip_path: Đường dẫn file zip
+            
+        Returns:
+            Optional[pd.DataFrame]: DataFrame chứa dữ liệu
+        """
+        try:
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                # Lấy tên file csv trong zip
+                csv_filename = zip_ref.namelist()[0]
+                
+                # Đọc file csv vào DataFrame
+                with zip_ref.open(csv_filename) as csv_file:
+                    # Binance format: [timestamp, open, high, low, close, volume, ...]
+                    df = pd.read_csv(
+                        csv_file,
+                        header=None,
+                        usecols=[0, 1, 2, 3, 4, 5],  # Chỉ lấy 6 cột đầu
+                        names=['timestamp', 'open', 'high', 'low', 'close', 'volume']
+                    )
+                    
+                    # Convert timestamp
+                    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                    
+                    # Convert price columns to float
+                    for col in ['open', 'high', 'low', 'close', 'volume']:
+                        df[col] = pd.to_numeric(df[col], errors='coerce')
+                    
+                    return df
+                    
+        except Exception as e:
+            logger.error(f"❌ Lỗi xử lý {zip_path}: {e}")
+            return None
+    
+    def download_all_for_symbol(
+        self, 
+        symbol: str, 
+        intervals: List[str] = None
+    ) -> Dict[str, pd.DataFrame]:
+        """
+        Tải tất cả dữ liệu cho 1 symbol
+        
+        Args:
+            symbol: Trading pair
+            intervals: List các khung thời gian cần tải
+            
+        Returns:
+            Dict[str, pd.DataFrame]: Dictionary {interval: dataframe}
+        """
+        if intervals is None:
+            intervals = INTERVALS
+            
+        result = {}
+        
+        for interval in intervals:
+            logger.info(f"🔄 Đang xử lý {symbol} - {interval}")
+            
+            # Lấy danh sách tháng có dữ liệu
+            available_months = self.get_available_months(symbol, interval)
+            
+            if not available_months:
+                logger.warning(f"⚠️ Không tìm thấy dữ liệu {symbol} {interval}")
+                continue
+            
+            # Tải từng tháng
+            all_dfs = []
+            for year, month in available_months:
+                zip_path = self.download_monthly_data(symbol, interval, year, month)
+                if zip_path:
+                    df = self.process_zip_to_csv(zip_path)
+                    if df is not None and not df.empty:
+                        all_dfs.append(df)
+            
+            # Ghép tất cả các tháng
+            if all_dfs:
+                full_df = pd.concat(all_dfs, ignore_index=True)
+                
+                # Sắp xếp theo timestamp và loại bỏ trùng lặp
+                full_df = full_df.sort_values('timestamp').drop_duplicates(subset=['timestamp'])
+                
+                # Lưu file CSV tổng hợp
+                output_file = PROCESSED_DIR / f"{symbol}_{interval}.csv"
+                full_df.to_csv(output_file, index=False)
+                logger.info(f"💾 Đã lưu {symbol} {interval}: {len(full_df)} rows -> {output_file}")
+                
+                result[interval] = full_df
+                
+        return result
+    
+    def download_bulk(
+        self, 
+        symbols: List[str], 
+        intervals: List[str] = None,
+        max_workers: int = None
+    ):
+        """
+        Tải dữ liệu cho nhiều symbols song song
+        
+        Args:
+            symbols: List các trading pairs
+            intervals: List các khung thời gian
+            max_workers: Số luồng tải song song
+        """
+        if intervals is None:
+            intervals = INTERVALS
+            
+        if max_workers is None:
+            max_workers = MAX_WORKERS
+            
+        logger.info(f"🚀 Bắt đầu tải dữ liệu cho {len(symbols)} symbols, {intervals}")
+        logger.info(f"📁 Thư mục lưu: {RAW_DIR}")
+        
+        start_time = time.time()
+        
+        # Dùng ThreadPoolExecutor để tải song song
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = []
+            for symbol in symbols:
+                future = executor.submit(
+                    self.download_all_for_symbol, 
+                    symbol, 
+                    intervals
+                )
+                futures.append(future)
+            
+            # Theo dõi tiến trình
+            for i, future in enumerate(tqdm(as_completed(futures), total=len(futures), desc="Tổng tiến độ")):
+                try:
+                    result = future.result(timeout=300)
+                    symbol = symbols[i]
+                    if result:
+                        logger.info(f"✅ Hoàn thành {symbol}: {list(result.keys())}")
+                except Exception as e:
+                    logger.error(f"❌ Lỗi xử lý symbol: {e}")
+        
+        elapsed_time = time.time() - start_time
+        logger.info(f"🎉 Hoàn thành! Tổng thời gian: {elapsed_time:.2f} giây")
+        
+    def load_data(self, symbol: str, interval: str) -> Optional[pd.DataFrame]:
+        """
+        Đọc dữ liệu đã tải từ file CSV
+        
+        Args:
+            symbol: Trading pair
+            interval: Khung thời gian
+            
+        Returns:
+            Optional[pd.DataFrame]: DataFrame chứa dữ liệu
+        """
+        filepath = PROCESSED_DIR / f"{symbol}_{interval}.csv"
+        
+        if not filepath.exists():
+            logger.error(f"❌ Không tìm thấy file {filepath}")
+            return None
+            
+        try:
+            df = pd.read_csv(filepath)
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            logger.info(f"✅ Đã đọc {symbol} {interval}: {len(df)} rows từ {filepath}")
+            return df
+        except Exception as e:
+            logger.error(f"❌ Lỗi đọc {filepath}: {e}")
+            return None
+
+
+def main():
+    """
+    Hàm chính để chạy downloader
+    """
+    # Khởi tạo downloader
+    downloader = BinanceDataDownloader()
+    
+    # Bước 1: Lấy top coins theo volume
+    logger.info("📊 Đang lấy top coins từ Binance...")
+    symbols = downloader.get_top_volume_symbols(limit=TOP_COINS_LIMIT)
+    
+    if not symbols:
+        logger.error("❌ Không thể lấy danh sách coins. Kiểm tra kết nối.")
+        return
+    
+    # Bước 2: Hỏi người dùng muốn tải tất cả hay chọn lọc
+    print(f"\n📋 Danh sách top {len(symbols)} coins:")
+    for i, symbol in enumerate(symbols[:20], 1):
+        print(f"   {i:2d}. {symbol}")
+    print("   ...")
+    
+    choice = input(f"\n🔄 Tải tất cả {len(symbols)} coins? (y/n, default=y): ").strip().lower()
+    
+    if choice == 'n':
+        # Cho phép nhập custom list
+        custom_input = input("Nhập symbols cách nhau bằng dấu phẩy (VD: BTCUSDT,ETHUSDT,SOLUSDT): ")
+        symbols = [s.strip().upper() for s in custom_input.split(',') if s.strip()]
+        print(f"📋 Sẽ tải {len(symbols)} coins: {', '.join(symbols)}")
+    else:
+        print(f"📋 Sẽ tải tất cả {len(symbols)} coins")
+    
+    # Bước 3: Xác nhận intervals
+    print(f"\n⏰ Khung thời gian sẽ tải: {INTERVALS}")
+    
+    # Bước 4: Bắt đầu download
+    confirm = input("\n🚀 Bắt đầu tải? (y/n, default=y): ").strip().lower()
+    
+    if confirm != 'n':
+        downloader.download_bulk(symbols, intervals=INTERVALS)
+        
+        # Bước 5: Hiển thị thống kê
+        print("\n📊 Thống kê dữ liệu đã tải:")
+        for interval in INTERVALS:
+            csv_files = list(PROCESSED_DIR.glob(f"*_{interval}.csv"))
+            print(f"   {interval}: {len(csv_files)} files")
+            
+        print(f"\n📁 Dữ liệu được lưu tại:")
+        print(f"   - Raw ZIP: {RAW_DIR}")
+        print(f"   - Processed CSV: {PROCESSED_DIR}")
+    else:
+        print("❌ Đã hủy")
+
+
+if __name__ == "__main__":
+    main()
+
+5. File .env (tùy chọn)
+# Cấu hình download
+TOP_COINS_LIMIT=100
+MAX_WORKERS=3
+START_YEAR=2019
+DOWNLOAD_DELAY = 0.5  # giây giữa các request
+
+6. Script utility để kiểm tra dữ liệu
+# check_data.py
+import pandas as pd
+from pathlib import Path
+from config import PROCESSED_DIR
+
+def check_data_quality(symbol: str, interval: str):
+    """Kiểm tra chất lượng dữ liệu"""
+    filepath = PROCESSED_DIR / f"{symbol}_{interval}.csv"
+    
+    if not filepath.exists():
+        print(f"❌ Không tìm thấy {filepath}")
+        return
+    
+    df = pd.read_csv(filepath)
+    df['timestamp'] = pd.to_datetime(df['timestamp'])
+    
+    print(f"\n📊 {symbol} - {interval}")
+    print(f"   Số lượng rows: {len(df):,}")
+    print(f"   Từ: {df['timestamp'].min()}")
+    print(f"   Đến: {df['timestamp'].max()}")
+    print(f"   Khoảng cách trung bình: {df['timestamp'].diff().mean()}")
+    print(f"   Missing timestamps: {df['timestamp'].diff().gt(pd.Timedelta(hours=2)).sum() if interval=='1h' else df['timestamp'].diff().gt(pd.Timedelta(hours=5)).sum()}")
+    
+    # Thống kê giá
+    print(f"   Giá thấp nhất: ${df['low'].min():,.2f}")
+    print(f"   Giá cao nhất: ${df['high'].max():,.2f}")
+    print(f"   Volume trung bình: {df['volume'].mean():,.0f}")
+
+# Kiểm tra một số coin
+for symbol in ['BTCUSDT', 'ETHUSDT', 'SOLUSDT']:
+    for interval in ['1h', '4h']:
+        check_data_quality(symbol, interval)
+
+7. Đóng gói lại ứng dụng để tôi chạy file exe trên window là có thể chạy được ngay (nếu không thể thì có thể đóng gói script setup riêng, script chạy ứng dụng riêng)
