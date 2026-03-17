@@ -1,353 +1,517 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-Binance Spot Data Downloader
-Download historical kline data for many symbols and intervals.
+Binance Spot Data Downloader - WINDOWS FIXED VERSION
+Đã sửa lỗi Unicode và AttributeError cho Windows
 """
 
-from __future__ import annotations
-
-import logging
-import time
+import os
+import sys
+import json
 import zipfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
-from typing import Dict, List, Optional, Tuple
-
-import pandas as pd
 import requests
-from requests.adapters import HTTPAdapter
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
-from urllib3.util.retry import Retry
+import time
+import logging
+from typing import List, Dict, Optional, Tuple
+import warnings
+warnings.filterwarnings('ignore')
 
+# Import config
 from config import (
-    BINANCE_API_URL,
-    BINANCE_DATA_URL,
-    DOWNLOAD_DELAY,
-    END_YEAR,
-    INTERVALS,
-    MAX_WORKERS,
-    PROCESSED_DIR,
-    RAW_DIR,
-    START_YEAR,
-    TOP_COINS_LIMIT,
+    RAW_DIR, PROCESSED_DIR, INTERVALS, START_YEAR, END_YEAR,
+    TOP_COINS_LIMIT, MAX_WORKERS, BINANCE_API_URL, BINANCE_DATA_URL
 )
 
+# === FIX 1: XỬ LÝ UNICODE CHO WINDOWS ===
+# Tắt hoàn toàn emoji, chỉ dùng text thường
+# Tạo custom formatter không dùng emoji
+class NoEmojiFormatter(logging.Formatter):
+    """Formatter loại bỏ emoji cho Windows console"""
+    def format(self, record):
+        msg = super().format(record)
+        # Thay thế emoji bằng text
+        replacements = {
+            '🚀': '[ROCKET]',
+            '📁': '[FOLDER]',
+            '🔄': '[SYNC]',
+            '✅': '[OK]',
+            '❌': '[ERROR]',
+            '⚠️': '[WARN]',
+            '📊': '[CHART]',
+            '💾': '[SAVE]',
+            '🔍': '[SEARCH]',
+            '🎉': '[DONE]',
+            '⏰': '[TIME]',
+            '📋': '[LIST]',
+            '🔧': '[TOOL]',
+            '⚡': '[FAST]',
+            '📈': '[UP]',
+            '📉': '[DOWN]',
+            '💰': '[MONEY]',
+            '🛑': '[STOP]',
+            '🎯': '[TARGET]',
+            '📦': '[BOX]',
+            '🌊': '[WAVE]',
+            '⚖️': '[SCALE]',
+            '💵': '[DOLLAR]',
+            '📝': '[NOTE]',
+            '🔐': '[LOCK]',
+            'ℹ️': '[INFO]',
+            '✅': '[OK]',
+            '❌': '[ERROR]',
+            '⚠️': '[WARNING]'
+        }
+        for emoji, text in replacements.items():
+            msg = msg.replace(emoji, text)
+        return msg
+
+# Cấu hình logging với encoding UTF-8 cho file
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
+    format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler(RAW_DIR / "download.log"),
-        logging.StreamHandler(),
-    ],
+        logging.FileHandler(RAW_DIR / 'download.log', encoding='utf-8'),
+        logging.StreamHandler(sys.stdout)  # Stream ra console không emoji
+    ]
 )
 logger = logging.getLogger(__name__)
 
+# Override handler để xử lý emoji
+for handler in logger.handlers:
+    handler.setFormatter(NoEmojiFormatter('%(asctime)s - %(levelname)s - %(message)s'))
+
 
 class BinanceDataDownloader:
-    def __init__(self) -> None:
+    """
+    Binance Data Downloader Class - Windows Fixed Version
+    """
+    
+    def __init__(self):
         self.session = requests.Session()
-        self.session.headers.update(
-            {
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/122.0.0.0 Safari/537.36"
-                )
-            }
-        )
-        retries = Retry(
-            total=3,
-            backoff_factor=0.5,
-            status_forcelist=(429, 500, 502, 503, 504),
-            allowed_methods=frozenset(["GET", "HEAD"]),
-        )
-        adapter = HTTPAdapter(max_retries=retries)
-        self.session.mount("https://", adapter)
-        self.session.mount("http://", adapter)
-
-    def _safe_request(self, method: str, url: str, **kwargs) -> requests.Response:
-        if DOWNLOAD_DELAY > 0:
-            time.sleep(DOWNLOAD_DELAY)
-        response = self.session.request(method=method, url=url, **kwargs)
-        return response
-
-    def get_top_volume_symbols(self, limit: int = 100) -> List[str]:
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        })
+        # Danh sách các coin không hợp lệ cần bỏ qua
+        self.invalid_symbols = [
+            'USD1USDT', 'USDCUSDT', 'BUSDUSDT', 'DAIUSDT', 'TUSDUSDT', 
+            'USDPUSDT', 'GUSDUSDT', 'PAXUSDT', 'USTUSDT', 'LUNAUSDT',
+            'WINUSDT', 'SUNUSDT', 'FLOKIUSDT', 'PEPEUSDT', 'BONKUSDT'
+        ]
+    
+    def safe_timestamp_conversion(self, timestamp_ms):
+        """
+        Chuyển đổi timestamp an toàn, tránh lỗi out of bounds
+        """
         try:
-            response = self._safe_request("GET", f"{BINANCE_API_URL}/ticker/24hr", timeout=30)
+            if timestamp_ms > 946684800000 and timestamp_ms < 1893456000000:
+                return pd.to_datetime(timestamp_ms, unit='ms')
+            else:
+                return None
+        except (pd.errors.OutOfBoundsDatetime, ValueError, OverflowError):
+            return None
+    
+    def get_top_volume_symbols(self, limit: int = 100) -> List[str]:
+        """
+        Lấy danh sách top coins theo volume 24h từ Binance
+        """
+        try:
+            url = f"{BINANCE_API_URL}/ticker/24hr"
+            response = self.session.get(url)
             response.raise_for_status()
+            
             tickers = response.json()
-
-            stable_base = ("USDC", "BUSD", "DAI", "TUSD", "FDUSD", "USDP")
-            usdt_pairs = [
-                t
-                for t in tickers
-                if t["symbol"].endswith("USDT")
-                and float(t.get("quoteVolume", 0)) > 0
-                and not t["symbol"].startswith(stable_base)
-            ]
-
-            sorted_pairs = sorted(usdt_pairs, key=lambda x: float(x["quoteVolume"]), reverse=True)
-            top_symbols = [p["symbol"] for p in sorted_pairs[:limit]]
-            logger.info("Loaded %s symbols by quote volume", len(top_symbols))
-            logger.info("Top 10 symbols: %s", ", ".join(top_symbols[:10]))
+            
+            # Lọc các cặp USDT và có volume > 0
+            usdt_pairs = []
+            for t in tickers:
+                symbol = t['symbol']
+                if (symbol.endswith('USDT') and 
+                    float(t['quoteVolume']) > 0 and
+                    symbol not in self.invalid_symbols and
+                    not any(s in symbol for s in ['UP', 'DOWN', 'BULL', 'BEAR'])):
+                    usdt_pairs.append(t)
+            
+            # Sắp xếp theo quoteVolume
+            sorted_pairs = sorted(
+                usdt_pairs, 
+                key=lambda x: float(x['quoteVolume']), 
+                reverse=True
+            )
+            
+            top_symbols = [p['symbol'] for p in sorted_pairs[:limit]]
+            
+            logger.info(f"[OK] Da lay {len(top_symbols)} top coins theo volume")
+            logger.info(f"Top 10: {', '.join(top_symbols[:10])}")
+            
             return top_symbols
-        except Exception as exc:
-            logger.error("Cannot fetch symbols from Binance API: %s", exc)
-            fallback = [
-                "BTCUSDT",
-                "ETHUSDT",
-                "BNBUSDT",
-                "SOLUSDT",
-                "XRPUSDT",
-                "ADAUSDT",
-                "AVAXUSDT",
-                "DOGEUSDT",
-                "DOTUSDT",
-                "LINKUSDT",
-                "MATICUSDT",
-                "SHIBUSDT",
-                "LTCUSDT",
-                "UNIUSDT",
-                "ATOMUSDT",
-                "ETCUSDT",
-                "FILUSDT",
-                "ICPUSDT",
-                "NEARUSDT",
-                "APTUSDT",
-                "OPUSDT",
-                "ARBUSDT",
-                "HBARUSDT",
-                "VETUSDT",
-                "ALGOUSDT",
-            ]
-            return fallback[:limit]
-
+            
+        except Exception as e:
+            logger.error(f"[ERROR] Loi khi lay top symbols: {e}")
+            # Fallback list
+            return [
+                'BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT',
+                'ADAUSDT', 'AVAXUSDT', 'DOGEUSDT', 'DOTUSDT', 'LINKUSDT'
+            ][:limit]
+    
     def get_available_months(self, symbol: str, interval: str) -> List[Tuple[int, int]]:
-        available: List[Tuple[int, int]] = []
-        now = datetime.now()
-        max_year = min(END_YEAR, now.year)
-
-        for year in range(START_YEAR, max_year + 1):
-            end_month = 12 if year < now.year else now.month
-            for month in range(1, end_month + 1):
-                filename = f"{symbol}-{interval}-{year}-{month:02d}.zip"
-                monthly_url = (
-                    f"{BINANCE_DATA_URL}/data/spot/monthly/klines/{symbol}/{interval}/{filename}"
-                )
+        """
+        Kiểm tra những tháng nào có dữ liệu
+        """
+        available = []
+        current_date = datetime.now()
+        
+        for year in range(START_YEAR, current_date.year + 1):
+            start_month = 1
+            end_month = 12
+            
+            if year == current_date.year:
+                end_month = current_date.month
+            
+            for month in range(start_month, end_month + 1):
+                url = f"{BINANCE_DATA_URL}/data/spot/monthly/klines/{symbol}/{interval}/{symbol}-{interval}-{year}-{month:02d}.zip"
                 try:
-                    res = self._safe_request("HEAD", monthly_url, timeout=10)
-                    if res.status_code == 200:
+                    response = self.session.head(url, timeout=5)
+                    if response.status_code == 200:
                         available.append((year, month))
-                        continue
-
-                    # Monthly file can be missing for very recent periods, try first daily file.
-                    daily_filename = f"{symbol}-{interval}-{year}-{month:02d}-01.zip"
-                    daily_url = (
-                        f"{BINANCE_DATA_URL}/data/spot/daily/klines/{symbol}/{interval}/{daily_filename}"
-                    )
-                    daily_res = self._safe_request("HEAD", daily_url, timeout=10)
-                    if daily_res.status_code == 200:
-                        available.append((year, month))
-                except Exception:
+                except:
                     continue
+                    
         return available
-
+    
     def download_monthly_data(
-        self, symbol: str, interval: str, year: int, month: int
-    ) -> Optional[str]:
+        self, 
+        symbol: str, 
+        interval: str, 
+        year: int, 
+        month: int
+    ) -> Optional[Path]:
+        """
+        Tải dữ liệu hàng tháng cho 1 symbol
+        Trả về Path object thay vì string
+        """
         filename = f"{symbol}-{interval}-{year}-{month:02d}.zip"
         filepath = RAW_DIR / filename
-
-        if filepath.exists():
+        
+        # Kiểm tra nếu file đã tồn tại
+        if filepath.exists() and filepath.stat().st_size > 1000:
             try:
-                with zipfile.ZipFile(filepath, "r") as zip_ref:
+                with zipfile.ZipFile(filepath, 'r') as zip_ref:
                     if zip_ref.testzip() is None:
-                        return str(filepath)
-            except Exception:
-                logger.warning("Corrupted file found, re-downloading %s", filename)
-                filepath.unlink(missing_ok=True)
-
-        monthly_url = f"{BINANCE_DATA_URL}/data/spot/monthly/klines/{symbol}/{interval}/{filename}"
-        daily_filename = f"{symbol}-{interval}-{year}-{month:02d}-01.zip"
-        daily_url = f"{BINANCE_DATA_URL}/data/spot/daily/klines/{symbol}/{interval}/{daily_filename}"
-
-        for attempt in range(3):
+                        logger.debug(f"[FOLDER] File {filename} da ton tai va OK")
+                        return filepath
+            except:
+                logger.warning(f"[WARN] File {filename} bi hong, tai lai...")
+                filepath.unlink()
+        
+        # Tải file
+        url = f"{BINANCE_DATA_URL}/data/spot/monthly/klines/{symbol}/{interval}/{filename}"
+        
+        max_retries = 2
+        for attempt in range(max_retries):
             try:
-                response = self._safe_request("GET", monthly_url, stream=True, timeout=60)
-                if response.status_code != 200:
-                    response = self._safe_request("GET", daily_url, stream=True, timeout=60)
-
-                if response.status_code != 200:
-                    if attempt < 2:
-                        time.sleep(2**attempt)
-                        continue
-                    return None
-
-                total_size = int(response.headers.get("content-length", 0))
-                with open(filepath, "wb") as file_obj:
-                    with tqdm(
-                        total=total_size,
-                        unit="B",
-                        unit_scale=True,
-                        desc=f"{symbol} {interval} {year}-{month:02d}",
-                        leave=False,
-                    ) as pbar:
+                response = self.session.get(url, stream=True, timeout=30)
+                
+                if response.status_code == 200:
+                    total_size = int(response.headers.get('content-length', 0))
+                    
+                    if total_size < 1000:
+                        logger.debug(f"[WARN] File {filename} qua nho ({total_size} bytes), bo qua")
+                        return None
+                    
+                    with open(filepath, 'wb') as f:
                         for chunk in response.iter_content(chunk_size=8192):
-                            if not chunk:
-                                continue
-                            file_obj.write(chunk)
-                            pbar.update(len(chunk))
-
-                with zipfile.ZipFile(filepath, "r") as zip_ref:
-                    if zip_ref.testzip() is not None:
-                        raise zipfile.BadZipFile("ZIP integrity failed")
-                return str(filepath)
-            except Exception as exc:
-                if attempt < 2:
-                    time.sleep(2**attempt)
+                            f.write(chunk)
+                    
+                    # Verify file
+                    try:
+                        with zipfile.ZipFile(filepath, 'r') as zip_ref:
+                            if zip_ref.testzip() is not None:
+                                raise Exception("File bi hong")
+                        logger.debug(f"[OK] Downloaded: {filename}")
+                        return filepath
+                    except:
+                        filepath.unlink()
+                        raise
+                    
+                elif attempt < max_retries - 1:
+                    time.sleep(2)
                 else:
-                    logger.error("Failed to download %s: %s", filename, exc)
-                    filepath.unlink(missing_ok=True)
+                    logger.debug(f"[ERROR] Khong tim thay {filename}")
+                    
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    time.sleep(2)
+                else:
+                    logger.error(f"[ERROR] Loi tai {filename}: {e}")
+                    
         return None
-
-    def process_zip_to_csv(self, zip_path: str) -> Optional[pd.DataFrame]:
+    
+    def process_zip_to_csv(self, zip_path: Path) -> Optional[pd.DataFrame]:
+        """
+        Giải nén file zip và chuyển thành DataFrame
+        zip_path là Path object, không phải string
+        """
         try:
-            with zipfile.ZipFile(zip_path, "r") as zip_ref:
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
                 csv_filename = zip_ref.namelist()[0]
+                
                 with zip_ref.open(csv_filename) as csv_file:
-                    df = pd.read_csv(
-                        csv_file,
-                        header=None,
-                        usecols=[0, 1, 2, 3, 4, 5],
-                        names=["timestamp", "open", "high", "low", "close", "volume"],
-                    )
-
-            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
-            for col in ("open", "high", "low", "close", "volume"):
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-            df = df.dropna(subset=["timestamp", "open", "high", "low", "close", "volume"])
-            return df
-        except Exception as exc:
-            logger.error("Cannot process %s: %s", zip_path, exc)
+                    try:
+                        # Đọc CSV
+                        df = pd.read_csv(
+                            csv_file,
+                            header=None,
+                            usecols=[0, 1, 2, 3, 4, 5],
+                            names=['timestamp', 'open', 'high', 'low', 'close', 'volume'],
+                            dtype={
+                                'timestamp': 'int64',
+                                'open': 'float64',
+                                'high': 'float64',
+                                'low': 'float64',
+                                'close': 'float64',
+                                'volume': 'float64'
+                            },
+                            on_bad_lines='skip'
+                        )
+                        
+                        # Lọc timestamp hợp lệ
+                        valid_mask = (df['timestamp'] >= 946684800000) & (df['timestamp'] <= 1893456000000)
+                        df_valid = df[valid_mask].copy()
+                        
+                        if df_valid.empty:
+                            logger.warning(f"[WARN] {zip_path.name}: Khong co timestamp hop le")
+                            return None
+                        
+                        # Chuyển đổi timestamp
+                        try:
+                            df_valid['timestamp'] = pd.to_datetime(df_valid['timestamp'], unit='ms')
+                        except Exception as e:
+                            logger.error(f"[ERROR] Loi chuyen timestamp {zip_path.name}: {e}")
+                            return None
+                        
+                        logger.debug(f"[OK] Da doc {zip_path.name}: {len(df_valid)} rows")
+                        return df_valid
+                        
+                    except Exception as e:
+                        logger.error(f"[ERROR] Loi doc CSV {zip_path.name}: {e}")
+                        return None
+                        
+        except zipfile.BadZipFile:
+            logger.error(f"[ERROR] {zip_path.name}: File zip bi hong")
+            try:
+                zip_path.unlink()
+            except:
+                pass
             return None
-
+        except Exception as e:
+            logger.error(f"[ERROR] Loi xu ly {zip_path.name}: {e}")
+            return None
+    
     def download_all_for_symbol(
-        self, symbol: str, intervals: Optional[List[str]] = None
+        self, 
+        symbol: str, 
+        intervals: List[str] = None
     ) -> Dict[str, pd.DataFrame]:
-        intervals = intervals or INTERVALS
-        result: Dict[str, pd.DataFrame] = {}
-
+        """
+        Tải tất cả dữ liệu cho 1 symbol
+        """
+        if intervals is None:
+            intervals = INTERVALS
+            
+        if symbol in self.invalid_symbols:
+            logger.warning(f"[WARN] Bo qua {symbol} - Invalid symbol")
+            return {}
+            
+        result = {}
+        
         for interval in intervals:
-            logger.info("Processing %s - %s", symbol, interval)
+            logger.info(f"[SYNC] Dang xu ly {symbol} - {interval}")
+            
+            # Lấy danh sách tháng có dữ liệu
             available_months = self.get_available_months(symbol, interval)
+            
             if not available_months:
-                logger.warning("No data for %s %s", symbol, interval)
+                logger.warning(f"[WARN] Khong tim thay du lieu {symbol} {interval}")
                 continue
-
-            all_dfs: List[pd.DataFrame] = []
+            
+            # Tải từng tháng
+            all_dfs = []
             for year, month in available_months:
                 zip_path = self.download_monthly_data(symbol, interval, year, month)
-                if not zip_path:
-                    continue
-                df = self.process_zip_to_csv(zip_path)
-                if df is not None and not df.empty:
-                    all_dfs.append(df)
-
-            if not all_dfs:
-                continue
-
-            full_df = pd.concat(all_dfs, ignore_index=True)
-            full_df = full_df.sort_values("timestamp").drop_duplicates(subset=["timestamp"])
-            output_file = PROCESSED_DIR / f"{symbol}_{interval}.csv"
-            full_df.to_csv(output_file, index=False)
-            logger.info("Saved %s rows to %s", len(full_df), output_file)
-            result[interval] = full_df
-        return result
-
-    def download_bulk(
-        self, symbols: List[str], intervals: Optional[List[str]] = None, max_workers: Optional[int] = None
-    ) -> None:
-        intervals = intervals or INTERVALS
-        max_workers = max_workers or MAX_WORKERS
-
-        logger.info("Start bulk download: symbols=%s intervals=%s workers=%s", len(symbols), intervals, max_workers)
-        start = time.time()
-
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_symbol = {
-                executor.submit(self.download_all_for_symbol, symbol, intervals): symbol
-                for symbol in symbols
-            }
-
-            for future in tqdm(as_completed(future_to_symbol), total=len(future_to_symbol), desc="Overall progress"):
-                symbol = future_to_symbol[future]
+                if zip_path:
+                    df = self.process_zip_to_csv(zip_path)
+                    if df is not None and not df.empty and len(df) > 100:
+                        all_dfs.append(df)
+            
+            # Ghép dữ liệu
+            if all_dfs:
                 try:
-                    result = future.result(timeout=3600)
-                    if result:
-                        logger.info("Completed %s -> %s", symbol, list(result.keys()))
+                    full_df = pd.concat(all_dfs, ignore_index=True)
+                    full_df = full_df.sort_values('timestamp').drop_duplicates(subset=['timestamp'])
+                    
+                    if len(full_df) > 1000:
+                        output_file = PROCESSED_DIR / f"{symbol}_{interval}.csv"
+                        full_df.to_csv(output_file, index=False)
+                        logger.info(f"[SAVE] Da luu {symbol} {interval}: {len(full_df)} rows -> {output_file}")
+                        result[interval] = full_df
                     else:
-                        logger.warning("Completed %s with no output", symbol)
-                except Exception as exc:
-                    logger.error("Error for %s: %s", symbol, exc)
+                        logger.warning(f"[WARN] {symbol} {interval}: Qua it du lieu ({len(full_df)} rows)")
+                        
+                except Exception as e:
+                    logger.error(f"[ERROR] Loi ghep du lieu {symbol} {interval}: {e}")
+                
+        return result
+    
+    def download_bulk(
+        self, 
+        symbols: List[str], 
+        intervals: List[str] = None,
+        max_workers: int = None
+    ):
+        """
+        Tải dữ liệu cho nhiều symbols song song
+        """
+        if intervals is None:
+            intervals = INTERVALS
+            
+        if max_workers is None:
+            max_workers = MAX_WORKERS
+            
+        symbols = [s for s in symbols if s not in self.invalid_symbols]
+            
+        logger.info(f"[ROCKET] Bat dau tai du lieu cho {len(symbols)} symbols, {intervals}")
+        logger.info(f"[FOLDER] Thu muc luu: {RAW_DIR}")
+        
+        start_time = time.time()
+        
+        # Dùng ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {}
+            for symbol in symbols:
+                future = executor.submit(
+                    self.download_all_for_symbol, 
+                    symbol, 
+                    intervals
+                )
+                futures[future] = symbol
+            
+            # Theo dõi tiến trình
+            with tqdm(total=len(symbols), desc="Tong tien do") as pbar:
+                for future in as_completed(futures):
+                    symbol = futures[future]
+                    try:
+                        result = future.result(timeout=300)
+                        if result:
+                            logger.info(f"[OK] Hoan thanh {symbol}: {list(result.keys())}")
+                        else:
+                            logger.warning(f"[WARN] {symbol}: Khong co du lieu")
+                    except Exception as e:
+                        logger.error(f"[ERROR] Loi xu ly {symbol}: {str(e)}")
+                    pbar.update(1)
+        
+        elapsed_time = time.time() - start_time
+        logger.info(f"[DONE] Hoan thanh! Tong thoi gian: {elapsed_time:.2f} giay")
+        
+        # Thống kê
+        self.print_statistics()
+    
+    def print_statistics(self):
+        """In thống kê dữ liệu đã tải"""
+        print("\n" + "="*60)
+        print("THONG KE DU LIEU DA TAI")
+        print("="*60)
+        
+        for interval in INTERVALS:
+            csv_files = list(PROCESSED_DIR.glob(f"*_{interval}.csv"))
+            print(f"\n[TIME] {interval}: {len(csv_files)} files")
+            
+            if csv_files:
+                stats = []
+                for f in csv_files[:10]:
+                    try:
+                        df = pd.read_csv(f)
+                        stats.append({
+                            'symbol': f.stem.replace(f'_{interval}', ''),
+                            'rows': len(df),
+                            'size': f.stat().st_size / (1024**2)
+                        })
+                    except:
+                        pass
+                
+                stats.sort(key=lambda x: x['rows'], reverse=True)
+                print("   Top coins theo so luong rows:")
+                for s in stats[:5]:
+                    print(f"   - {s['symbol']}: {s['rows']:,} rows ({s['size']:.1f} MB)")
+        
+        print("\n" + "="*60)
 
-        elapsed = time.time() - start
-        logger.info("All done in %.2f seconds", elapsed)
 
-    def load_data(self, symbol: str, interval: str) -> Optional[pd.DataFrame]:
-        filepath = PROCESSED_DIR / f"{symbol}_{interval}.csv"
-        if not filepath.exists():
-            logger.error("CSV not found: %s", filepath)
-            return None
-        try:
-            df = pd.read_csv(filepath)
-            df["timestamp"] = pd.to_datetime(df["timestamp"])
-            logger.info("Loaded %s rows from %s", len(df), filepath)
-            return df
-        except Exception as exc:
-            logger.error("Cannot read %s: %s", filepath, exc)
-            return None
-
-
-def main() -> None:
+def main():
+    """
+    Hàm chính
+    """
+    print("""
+    ============================================================
+        BINANCE SPOT DATA DOWNLOADER - WINDOWS VERSION
+            Danh cho backtest chien luoc
+    ============================================================
+    """)
+    
+    # Khởi tạo downloader
     downloader = BinanceDataDownloader()
-    logger.info("Fetching top symbols from Binance...")
+    
+    # Bước 1: Lấy top coins
+    print("\n[CHART] Dang lay top coins tu Binance...")
     symbols = downloader.get_top_volume_symbols(limit=TOP_COINS_LIMIT)
-
+    
     if not symbols:
-        logger.error("No symbols available. Check your connection and retry.")
+        print("[ERROR] Khong the lay danh sach coins. Kiem tra ket noi.")
         return
-
-    print(f"\nTop {len(symbols)} symbols by quote volume:")
-    for idx, symbol in enumerate(symbols[:20], 1):
-        print(f"  {idx:2d}. {symbol}")
-    print("  ...")
-
-    choice = input(f"\nDownload all {len(symbols)} symbols? (y/n, default=y): ").strip().lower()
-    if choice == "n":
-        custom = input("Input symbols separated by comma (e.g. BTCUSDT,ETHUSDT,SOLUSDT): ")
-        symbols = [token.strip().upper() for token in custom.split(",") if token.strip()]
-        if not symbols:
-            logger.error("No valid symbol provided, stopping.")
-            return
-        print(f"Will download {len(symbols)} symbols: {', '.join(symbols)}")
+    
+    # Bước 2: Hiển thị danh sách
+    print(f"\n[LIST] Danh sach top {len(symbols)} coins:")
+    for i, symbol in enumerate(symbols[:20], 1):
+        print(f"   {i:2d}. {symbol}")
+    print("   ...")
+    
+    # Bước 3: Lọc bỏ invalid symbols
+    symbols = [s for s in symbols if s not in downloader.invalid_symbols]
+    print(f"\n[OK] Sau khi loc: {len(symbols)} coins hop le")
+    
+    # Bước 4: Hỏi người dùng
+    choice = input(f"\n[SYNC] Tai tat ca {len(symbols)} coins? (y/n, default=y): ").strip().lower()
+    
+    if choice == 'n':
+        custom_input = input("Nhap symbols cach nhau bang dau phay (VD: BTCUSDT,ETHUSDT,SOLUSDT): ")
+        symbols = [s.strip().upper() for s in custom_input.split(',') if s.strip()]
+        symbols = [s for s in symbols if s not in downloader.invalid_symbols]
+        print(f"[LIST] Se tai {len(symbols)} coins: {', '.join(symbols)}")
     else:
-        print(f"Will download all {len(symbols)} symbols.")
-
-    print(f"\nIntervals: {INTERVALS}")
-    confirm = input("Start download now? (y/n, default=y): ").strip().lower()
-    if confirm == "n":
-        print("Cancelled.")
-        return
-
-    downloader.download_bulk(symbols=symbols, intervals=INTERVALS)
-
-    print("\nDownload stats:")
-    for interval in INTERVALS:
-        csv_files = list(PROCESSED_DIR.glob(f"*_{interval}.csv"))
-        print(f"  {interval}: {len(csv_files)} files")
-    print("\nOutput folders:")
-    print(f"  RAW ZIP: {RAW_DIR}")
-    print(f"  PROCESSED CSV: {PROCESSED_DIR}")
+        print(f"[LIST] Se tai {len(symbols)} coins")
+    
+    # Bước 5: Xác nhận intervals
+    print(f"\n[TIME] Khung thoi gian se tai: {INTERVALS}")
+    
+    # Bước 6: Số luồng
+    workers = input(f"\n[TOOL] So luong tai song song (default=3, de xuat 2-3 cho may i5): ").strip()
+    if workers.isdigit():
+        max_workers = int(workers)
+    else:
+        max_workers = 3
+    
+    # Bước 7: Bắt đầu
+    confirm = input(f"\n[ROCKET] Bat dau tai voi {max_workers} luong? (y/n, default=y): ").strip().lower()
+    
+    if confirm != 'n':
+        downloader.download_bulk(symbols, intervals=INTERVALS, max_workers=max_workers)
+    else:
+        print("[ERROR] Da huy")
 
 
 if __name__ == "__main__":

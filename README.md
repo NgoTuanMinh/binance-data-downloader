@@ -19,7 +19,8 @@ Download historical Binance spot kline data for top-volume USDT pairs and export
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate  # Windows: .venv\Scripts\activate
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+source .venv/bin/activate  # Wndows: .venv\Scripts\activate
 pip install -r requirements.txt
 cp .env.example .env       # optional
 python download_data.py

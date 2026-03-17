@@ -43,7 +43,7 @@ def _get_intervals(default: str = "1h,4h") -> list[str]:
 # Download settings
 INTERVALS = _get_intervals()
 START_YEAR = _get_int("START_YEAR", 2019)
-END_YEAR = _get_int("END_YEAR", datetime.now().year)
+END_YEAR = _get_int("END_YEAR", datetime.now().year - 1)
 TOP_COINS_LIMIT = _get_int("TOP_COINS_LIMIT", 100)
 MAX_WORKERS = _get_int("MAX_WORKERS", 5)
 DOWNLOAD_DELAY = _get_float("DOWNLOAD_DELAY", 0.5)
