@@ -280,8 +280,28 @@ class BinanceDataDownloader:
                             on_bad_lines='skip'
                         )
                         
-                        # Lọc timestamp hợp lệ
-                        valid_mask = (df['timestamp'] >= 946684800000) & (df['timestamp'] <= 1893456000000)
+                        # Chuan hoa timestamp ve milliseconds.
+                        # Co du lieu tra ve theo ms (13 so) va us (16 so), can xu ly ca hai.
+                        ts = pd.to_numeric(df['timestamp'], errors='coerce')
+
+                        sec_min, sec_max = 946684800, 1893456000
+                        ms_min, ms_max = 946684800000, 1893456000000
+                        us_min, us_max = 946684800000000, 1893456000000000
+                        ns_min, ns_max = 946684800000000000, 1893456000000000000
+
+                        normalized_ts = pd.Series(index=df.index, dtype='float64')
+
+                        sec_mask = (ts >= sec_min) & (ts <= sec_max)
+                        ms_mask = (ts >= ms_min) & (ts <= ms_max)
+                        us_mask = (ts >= us_min) & (ts <= us_max)
+                        ns_mask = (ts >= ns_min) & (ts <= ns_max)
+
+                        normalized_ts.loc[sec_mask] = ts.loc[sec_mask] * 1000
+                        normalized_ts.loc[ms_mask] = ts.loc[ms_mask]
+                        normalized_ts.loc[us_mask] = (ts.loc[us_mask] // 1000)
+                        normalized_ts.loc[ns_mask] = (ts.loc[ns_mask] // 1000000)
+
+                        valid_mask = normalized_ts.notna()
                         df_valid = df[valid_mask].copy()
                         
                         if df_valid.empty:
@@ -290,7 +310,10 @@ class BinanceDataDownloader:
                         
                         # Chuyển đổi timestamp
                         try:
-                            df_valid['timestamp'] = pd.to_datetime(df_valid['timestamp'], unit='ms')
+                            df_valid['timestamp'] = pd.to_datetime(
+                                normalized_ts.loc[valid_mask].astype('int64'),
+                                unit='ms'
+                            )
                         except Exception as e:
                             logger.error(f"[ERROR] Loi chuyen timestamp {zip_path.name}: {e}")
                             return None
